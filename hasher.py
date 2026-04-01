@@ -397,14 +397,17 @@ def main():
     parser = argparse.ArgumentParser(
         description="Tor Browser Hasher for fapolicyd"
     )
-    parser.add_argument("--data-dir", default="/data",
-                        help="Directory for versions.json and manifest.rules")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("update", help="Process new versions only")
-    sub.add_parser("backfill", help="Process all historical versions")
+    # Shared arguments for all subcommands
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--data-dir", default="/data",
+                        help="Directory for versions.json and manifest.rules")
 
-    test_parser = sub.add_parser("test", help="Process a local archive")
+    sub.add_parser("update", parents=[common], help="Process new versions only")
+    sub.add_parser("backfill", parents=[common], help="Process all historical versions")
+
+    test_parser = sub.add_parser("test", parents=[common], help="Process a local archive")
     test_parser.add_argument("--archive", required=True,
                              help="Path to a .tar.xz archive")
     test_parser.add_argument("--version", required=True,
