@@ -80,8 +80,25 @@ def fetch_listing(url: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Version discovery
 # ---------------------------------------------------------------------------
+def version_sort_key(version_str: str) -> tuple:
+    """Parse a version string into a sortable tuple.
+
+    Examples: '14.0.1' -> (14, 0, 1, 1, 0)
+              '16.0a4' -> (16, 0, 0, 0, 4)
+    Alpha versions sort before their stable counterpart.
+    """
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?(?:a(\d+))?$", version_str)
+    if not match:
+        return (0, 0, 0, 0, 0)
+    major, minor = int(match.group(1)), int(match.group(2))
+    patch = int(match.group(3)) if match.group(3) else 0
+    alpha = int(match.group(4)) if match.group(4) else 0
+    is_stable = 1 if alpha == 0 else 0
+    return (major, minor, patch, is_stable, alpha)
+
+
 def discover_versions() -> list[dict]:
-    """Scrape the Tor archive and return a list of version info dicts."""
+    """Scrape the Tor archive and return a list of version info dicts, newest first."""
     log.info("Fetching version listing from %s", ARCHIVE_BASE)
     links = fetch_listing(f"{ARCHIVE_BASE}/")
     if not links:
@@ -95,6 +112,9 @@ def discover_versions() -> list[dict]:
         if version_re.match(link):
             channel = "alpha" if "a" in link else "stable"
             versions.append({"version": link, "channel": channel})
+
+    # Sort newest first
+    versions.sort(key=lambda v: version_sort_key(v["version"]), reverse=True)
 
     log.info("Found %d versions (%d stable, %d alpha)",
              len(versions),
@@ -294,7 +314,8 @@ def process_version(version: str, channel: str, data_dir: Path,
             # Discover the download URL
             url = find_archive_url(version)
             if url is None:
-                log.warning("No Linux x86_64 archive found for %s, skipping", version)
+                log.warning("No Linux x86_64 archive found for %s, marking as skipped", version)
+                record_version(data_dir, versions, version, channel, {})
                 return False
 
             # Download
@@ -323,6 +344,8 @@ def process_version(version: str, channel: str, data_dir: Path,
 def cmd_update(data_dir: Path):
     """Check for new versions and process them."""
     versions = load_versions(data_dir)
+    log.info("Loaded %d existing version(s) from %s/versions.json",
+             len(versions), data_dir)
     all_versions = discover_versions()
     if not all_versions:
         log.error("Could not discover any versions")
