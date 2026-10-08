@@ -13,12 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: python -m pip install -r requirements-windows.txt
-      - run: python -m unittest discover -s tests -v
       - run: docker build -f Containerfile -t hashgen:test .
+      - name: Test the shipped server runtime
+        run: docker run --rm --entrypoint python -v "$PWD/tests:/app/tests:ro" hashgen:test -m unittest discover -s tests -v
       - name: Verify client is absent from the server image
         run: docker run --rm --entrypoint sh hashgen:test -c 'test -z "$(find / -name HashgenClient.ps1 -print 2>/dev/null)"'
 
