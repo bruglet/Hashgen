@@ -10,7 +10,11 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  validation:
+    uses: ./.github/workflows/test.yml
+
   build:
+    needs: validation
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -426,6 +426,10 @@ def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", default="/data",
                         help="Directory for versions.json and manifest.rules")
+    common.add_argument("--platform", choices=("linux", "windows", "all"),
+                        default="linux", help="Platforms to process (default: linux)")
+    common.add_argument("--max-windows-artifacts", type=int, default=None,
+                        help="Maximum Windows packages attempted per run (resumable)")
 
     sub.add_parser("update", parents=[common], help="Process new versions only")
     sub.add_parser("backfill", parents=[common], help="Process all historical versions")
@@ -435,17 +439,35 @@ def main():
                              help="Path to a .tar.xz archive")
     test_parser.add_argument("--version", required=True,
                              help="Version string (e.g. 16.0a4)")
+    test_parser.add_argument("--bundle", choices=("browser", "expert"), default="browser",
+                            help="Windows local test bundle type")
 
     args = parser.parse_args()
+    if args.max_windows_artifacts is not None and args.max_windows_artifacts < 1:
+        parser.error("--max-windows-artifacts must be positive")
+    if args.command == "test" and args.platform == "all":
+        parser.error("test requires one platform")
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.command == "update":
-        cmd_update(data_dir)
-    elif args.command == "backfill":
-        cmd_backfill(data_dir)
-    elif args.command == "test":
-        cmd_test(args.archive, args.version, data_dir)
+    if args.platform in ("linux", "all"):
+        if args.command == "update":
+            cmd_update(data_dir)
+        elif args.command == "backfill":
+            cmd_backfill(data_dir)
+        elif args.command == "test":
+            cmd_test(args.archive, args.version, data_dir)
+
+    if args.platform in ("windows", "all"):
+        # Keep standalone Linux usage free of Windows-only dependencies.
+        from windows_hasher import run_windows
+        success = run_windows(data_dir, args.command,
+                              limit=args.max_windows_artifacts,
+                              archive=Path(args.archive) if args.command == "test" else None,
+                              version=getattr(args, "version", None),
+                              bundle=getattr(args, "bundle", "browser"))
+        if not success:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
