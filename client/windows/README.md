@@ -87,10 +87,22 @@ allow rule**. Its requested enforcement mode must already match that collection'
 mode; it will not silently activate somebody else's audit-only rules. If
 Application Identity is stopped with unrelated rules present, configure that
 service yourself before installing. Existing Script/MSI/Store policy remains
-intact. The candidate must allow the SYSTEM updater script and PowerShell host.
+intact. If no packaged-app rules exist, the client adds a managed publisher
+baseline allowing all signed packaged apps. Windows otherwise blocks every
+packaged app when EXE rules are enforced (AppLocker event 8027), including
+Windows Security and Store-installed apps. Existing packaged-app rules and
+their enforcement mode are preserved without adding a broad allow rule. The
+client checks for packaged-app rules before applying a policy and during effective
+policy verification. An unchanged feed still repairs an older EXE-only policy.
+Policy comparison canonicalizes XML and rule ordering so native Windows
+normalization does not trigger unnecessary reapplication. Effective-policy
+read-back is retried up to three times before rolling back a failed application.
+The candidate must allow the SYSTEM updater script and PowerShell host.
 
 Removing DLL enforcement or uninstalling removes only recognized Hashgen rules;
-if unrelated rules were added later, they remain. Independently modified
+if unrelated rules were added later, they remain. Uninstall removes the managed
+packaged-app baseline when no EXE rules remain. If unrelated EXE rules still
+need the baseline, it is retained to avoid reintroducing event 8027. Independently modified
 Hashgen deny-rule IDs with changed scope or conditions cause a conflict rather than
 being overwritten. If you need different target groups, adapt the client and
 its ownership scheme deliberately.
@@ -131,3 +143,9 @@ These tests do not configure a
 device. The Windows CI job runs them in Windows PowerShell 5.1. Native service,
 scheduled-task registration, ACLs, actual execution blocking, and installation
 rollback still require a Windows integration test before deployment.
+
+`tests/test_windows_packaged_apps.ps1` uses native `Test-AppLockerPolicy` against
+installed packages, checks that signed packaged apps are allowed while a native
+EXE hash deny still works, and checks the SYSTEM updater host. It does not install
+policy. Run it with Windows PowerShell 5.1 before deployment, then confirm fresh
+launches of Windows Security and representative Store apps on a test device.

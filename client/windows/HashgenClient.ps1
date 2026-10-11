@@ -79,9 +79,43 @@ function Get-RuleIndex([xml]$Policy) {
     return ,$index
 }
 
+function Get-PolicyDigest([xml]$Policy) {
+    # Native AppLocker normalizes attribute order and sorts rules by GUID.
+    # Compare canonical policies rather than raw XML serialization.
+    $normalized = Read-PolicyXml $Policy.OuterXml
+    foreach ($collection in $normalized.SelectNodes('/AppLockerPolicy/RuleCollection')) {
+        $rules = @($collection.SelectNodes('*[@Id]') | Sort-Object { ([guid]$_.GetAttribute('Id')).ToString() })
+        foreach ($rule in $rules) { [void]$collection.RemoveChild($rule) }
+        foreach ($rule in $rules) { [void]$collection.AppendChild($rule) }
+    }
+    $collections = @($normalized.SelectNodes('/AppLockerPolicy/RuleCollection') | Sort-Object { $_.GetAttribute('Type') })
+    foreach ($collection in $collections) { [void]$normalized.DocumentElement.RemoveChild($collection) }
+    foreach ($collection in $collections) { [void]$normalized.DocumentElement.AppendChild($collection) }
+    Add-Type -AssemblyName System.Security
+    $transform = New-Object System.Security.Cryptography.Xml.XmlDsigC14NTransform
+    $transform.LoadInput($normalized)
+    $stream = $transform.GetOutput([System.IO.Stream])
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose(); $stream.Dispose() }
+}
+
 function Test-OwnedRule([System.Xml.XmlElement]$Rule, [string]$Collection) {
     if ($Rule.GetAttribute('UserOrGroupSid') -ne 'S-1-1-0' -or $Rule.SelectSingleNode('Exceptions')) { return $false }
     $id = $Rule.GetAttribute('Id')
+    if ($Collection -eq 'Appx' -and $Rule.LocalName -eq 'FilePublisherRule' -and $Rule.GetAttribute('Action') -eq 'Allow') {
+        $conditions = @($Rule.SelectNodes('Conditions/FilePublisherCondition'))
+        if ($conditions.Count -ne 1 -or $Rule.SelectNodes('Conditions/*').Count -ne 1) { return $false }
+        $condition = $conditions[0]
+        $ranges = @($condition.SelectNodes('BinaryVersionRange'))
+        return ($id -eq (Get-RuleId 'Appx:allow-all-signed') -and
+                $condition.GetAttribute('PublisherName') -eq '*' -and
+                $condition.GetAttribute('ProductName') -eq '*' -and
+                $condition.GetAttribute('BinaryName') -eq '*' -and
+                $ranges.Count -eq 1 -and $condition.ChildNodes.Count -eq 1 -and
+                $ranges[0].GetAttribute('LowSection') -eq '0.0.0.0' -and
+                $ranges[0].GetAttribute('HighSection') -eq '*')
+    }
     if ($Rule.LocalName -eq 'FilePathRule' -and $Rule.GetAttribute('Action') -eq 'Allow') {
         $condition = $Rule.SelectSingleNode('Conditions/FilePathCondition')
         return ($null -ne $condition -and $condition.GetAttribute('Path') -eq '*' -and
@@ -204,7 +238,59 @@ function Merge-ClientPolicy([xml]$Local, [xml]$Desired) {
             $index[$id] = $imported
         }
     }
+    # Enforcing EXE rules without Appx rules blocks every packaged app (8027),
+    # including Windows Security and Store apps. Add Microsoft's signed-package
+    # baseline only when there are no unrelated packaged-app rules.
+    $appx = $result.SelectSingleNode('/AppLockerPolicy/RuleCollection[@Type="Appx"]')
+    $appxId = Get-RuleId 'Appx:allow-all-signed'
+    $removedAppx = $false
+    if ($appx) {
+        foreach ($rule in @($appx.SelectNodes('*[@Id]'))) {
+            if (Test-OwnedRule $rule 'Appx') {
+                [void]$index.Remove(([guid]$rule.GetAttribute('Id')).ToString())
+                [void]$appx.RemoveChild($rule)
+                $removedAppx = $true
+            }
+        }
+    }
+    $exeWanted = $Desired.SelectSingleNode('/AppLockerPolicy/RuleCollection[@Type="Exe"]')
+    $remainingExe = $result.SelectSingleNode('/AppLockerPolicy/RuleCollection[@Type="Exe"]')
+    $needsAppx = $exeWanted -or ($remainingExe -and $remainingExe.SelectNodes('*[@Id]').Count -gt 0)
+    if ($needsAppx) {
+        if ($index.ContainsKey($appxId)) { throw 'The Hashgen packaged-app baseline ID conflicts with a modified rule.' }
+        if (-not $appx) {
+            $appx = $result.CreateElement('RuleCollection')
+            $appx.SetAttribute('Type', 'Appx')
+            [void]$result.DocumentElement.AppendChild($appx)
+        }
+        if ($appx.SelectNodes('*[@Id]').Count -eq 0) {
+            $appxMode = if ($exeWanted) { $exeWanted.GetAttribute('EnforcementMode') } else { $remainingExe.GetAttribute('EnforcementMode') }
+            $appx.SetAttribute('EnforcementMode', $appxMode)
+            $baseline = Read-PolicyXml '<AppLockerPolicy Version="1"><RuleCollection Type="Appx"><FilePublisherRule Name="Hashgen: allow signed packaged apps" Description="Standalone packaged-app baseline" UserOrGroupSid="S-1-1-0" Action="Allow"><Conditions><FilePublisherCondition PublisherName="*" ProductName="*" BinaryName="*"><BinaryVersionRange LowSection="0.0.0.0" HighSection="*" /></FilePublisherCondition></Conditions></FilePublisherRule></RuleCollection></AppLockerPolicy>'
+            $allow = $result.ImportNode($baseline.SelectSingleNode('//FilePublisherRule'), $true)
+            $allow.SetAttribute('Id', $appxId)
+            [void]$appx.AppendChild($allow)
+        }
+        Assert-PackagedAppSafety $result
+    } elseif ($appx -and $removedAppx -and $appx.SelectNodes('*[@Id]').Count -eq 0) {
+        [void]$result.DocumentElement.RemoveChild($appx)
+    }
     return ,$result
+}
+
+function Assert-PackagedAppSafety([xml]$Policy) {
+    $exe = $Policy.SelectSingleNode('/AppLockerPolicy/RuleCollection[@Type="Exe"]')
+    if (-not $exe -or $exe.SelectNodes('*[@Id]').Count -eq 0) { return }
+    $appx = $Policy.SelectSingleNode('/AppLockerPolicy/RuleCollection[@Type="Appx"]')
+    if (-not $appx -or $appx.SelectNodes('*[@Id]').Count -eq 0) {
+        throw 'EXE rules require packaged-app rules to prevent a system-wide packaged-app lockout (AppLocker 8027).'
+    }
+    $id = Get-RuleId 'Appx:allow-all-signed'
+    foreach ($baseline in $appx.SelectNodes('*[@Id]')) {
+        if (([guid]$baseline.GetAttribute('Id')).ToString() -eq $id -and -not (Test-OwnedRule $baseline 'Appx')) {
+            throw 'Effective packaged-app baseline has been independently modified.'
+        }
+    }
 }
 
 function Assert-LocalPolicy([xml]$Local, [xml]$Effective) {
@@ -229,8 +315,22 @@ function Assert-LocalPolicy([xml]$Local, [xml]$Effective) {
     }
 }
 
-function Assert-DesiredPolicy([xml]$Effective, [xml]$Desired) {
+function Assert-DesiredPolicy([xml]$Effective, [xml]$Desired, [xml]$Candidate) {
+    if ($Desired.SelectSingleNode('/AppLockerPolicy/RuleCollection[@Type="Exe"]')) {
+        Assert-PackagedAppSafety $Effective
+    }
     $actualRules = Get-RuleIndex $Effective
+    if ($Candidate) {
+        $id = Get-RuleId 'Appx:allow-all-signed'
+        $expected = $Candidate.SelectSingleNode("/AppLockerPolicy/RuleCollection[@Type='Appx']/*[@Id='$id']")
+        if ($expected) {
+            $found = $actualRules[$id]
+            if (-not $found -or $found.ParentNode.GetAttribute('Type') -ne 'Appx' -or -not (Test-OwnedRule $found 'Appx') -or
+                $found.ParentNode.GetAttribute('EnforcementMode') -ne $expected.ParentNode.GetAttribute('EnforcementMode')) {
+                throw 'Effective policy is missing the requested signed-packaged-app baseline or its enforcement mode.'
+            }
+        }
+    }
     foreach ($collection in $Desired.SelectNodes('/AppLockerPolicy/RuleCollection')) {
         $type = $collection.GetAttribute('Type')
         $actual = $Effective.SelectSingleNode("/AppLockerPolicy/RuleCollection[@Type='$type']")
@@ -254,6 +354,19 @@ function Save-Text([string]$Path, [string]$Text) {
         if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Replace($temporary, $Path, [System.Management.Automation.Language.NullString]::Value) }
         else { [System.IO.File]::Move($temporary, $Path) }
     } finally { if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) } }
+}
+
+function Wait-DesiredPolicy([xml]$Desired, [xml]$Candidate) {
+    # Effective policy can briefly lag a successful local policy replacement.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Assert-DesiredPolicy (Read-PolicyXml (Get-AppLockerPolicy -Effective -Xml)) $Desired $Candidate
+            return
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Milliseconds 500
+        }
+    }
 }
 
 function Write-ClientLog([string]$Message) {
@@ -386,8 +499,9 @@ function Invoke-ClientUpdate($Config) {
         $lastPath = Join-Path $script:InstallRoot 'last-update.json'
         if (Test-Path -LiteralPath $lastPath) {
             $last = Get-Content $lastPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($last.desired_sha256 -eq $desiredDigest -and $last.local_policy_sha256 -eq (Get-TextHash $originalText)) {
-                Assert-DesiredPolicy $effective $desired
+            if ($last.desired_sha256 -eq $desiredDigest -and $last.local_policy_sha256 -eq (Get-TextHash $originalText) -and
+                (Get-PolicyDigest $candidate) -eq (Get-PolicyDigest $local)) {
+                Assert-DesiredPolicy $effective $desired $candidate
                 Enable-IdentityService
                 Write-ClientLog 'Policy unchanged; no application needed.'
                 return
@@ -414,7 +528,7 @@ function Invoke-ClientUpdate($Config) {
         try {
             Set-AppLockerPolicy -XmlPolicy $candidatePath
             $readBack = Get-AppLockerPolicy -Local -Xml
-            Assert-DesiredPolicy (Read-PolicyXml (Get-AppLockerPolicy -Effective -Xml)) $desired
+            Wait-DesiredPolicy $desired $candidate
             $state = @{ schema_version = 1; updated_at = [DateTime]::UtcNow.ToString('o');
                 server_generated_at = $manifest.generated_at; desired_sha256 = $desiredDigest;
                 local_policy_sha256 = (Get-TextHash $readBack); enable_dll = [bool]$Config.enable_dll;
@@ -510,7 +624,7 @@ function Invoke-ClientAction {
                 $config.installed = $false
                 Save-Text (Join-Path $script:InstallRoot 'config.json') ($config | ConvertTo-Json)
                 Write-ClientLog 'Uninstalled task and Hashgen policy rules. Protected scripts, backups, and logs retained.'
-                Write-Output 'Hashgen task and rules removed. Application Identity and unrelated rules were preserved.'
+                Write-Output 'Hashgen task and deny rules removed. Application Identity and unrelated rules were preserved; the packaged-app baseline is retained if remaining EXE rules need it.'
             }
         }
     } catch {
