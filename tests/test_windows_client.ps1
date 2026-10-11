@@ -25,7 +25,8 @@ $empty = Read-PolicyXml '<AppLockerPolicy Version="1" />'
 $exe = New-DesiredPolicy $manifest $false 'Enabled'
 $combined = New-DesiredPolicy $manifest $true 'Enabled'
 $standalone = Merge-ClientPolicy $empty $exe
-Assert ($standalone.SelectNodes('//RuleCollection').Count -eq 1) 'Executable-only policy has extra collections.'
+Assert ($standalone.SelectNodes('//RuleCollection').Count -eq 2) 'Standalone EXE policy needs EXE and Appx collections.'
+Assert (-not $standalone.SelectSingleNode('//RuleCollection[@Type="Dll"]')) 'Executable-only policy enabled DLL checks.'
 Assert ($standalone.SelectNodes('//FileHashRule').Count -eq 1) 'Executable hash rule missing.'
 Assert ($standalone.SelectSingleNode('//FilePathCondition').GetAttribute('Path') -eq '*') 'Fresh policy needs allow baseline.'
 Assert (Test-OwnedRule $standalone.SelectSingleNode('//FileHashRule') 'Exe') 'Generated deny was not recognized as owned.'
@@ -34,6 +35,32 @@ Assert-DesiredPolicy $standalone $exe
 Assert-LocalPolicy $standalone $standalone
 $repeated = Merge-ClientPolicy $standalone $exe
 Assert ($repeated.OuterXml -eq $standalone.OuterXml) 'Repeated composition creates duplicates or changes policy.'
+
+# Reproduce the 8027 incident: EXE enforcement plus absent/empty Appx rules.
+$legacy = Read-PolicyXml $standalone.OuterXml
+[void]$legacy.DocumentElement.RemoveChild($legacy.SelectSingleNode('//RuleCollection[@Type="Appx"]'))
+Assert-Throws { Assert-DesiredPolicy $legacy $exe } 'Effective EXE-only policy would lock out packaged apps.'
+$legacyEmpty = Read-PolicyXml ($legacy.OuterXml.Replace('</AppLockerPolicy>', '<RuleCollection Type="Appx" EnforcementMode="NotConfigured" /></AppLockerPolicy>'))
+Assert-Throws { Assert-DesiredPolicy $legacyEmpty $exe } 'Empty Appx collection hid packaged-app lockout.'
+foreach ($oldPolicy in @($legacy, $legacyEmpty)) {
+    $repaired = Merge-ClientPolicy $oldPolicy $exe
+    Assert-DesiredPolicy $repaired $exe
+    $baseline = $repaired.SelectSingleNode('//RuleCollection[@Type="Appx"]/FilePublisherRule')
+    Assert (Test-OwnedRule $baseline 'Appx') 'Missing or unowned signed-package baseline.'
+    Assert ($baseline.SelectSingleNode('Conditions/FilePublisherCondition').GetAttribute('PublisherName') -eq '*') 'Baseline would exclude signed system apps.'
+}
+$appxTampered = Read-PolicyXml $standalone.OuterXml
+$appxTampered.SelectSingleNode('//FilePublisherCondition').SetAttribute('ProductName', 'OnlyOneApp')
+Assert-Throws { Merge-ClientPolicy $appxTampered $exe } 'Modified Appx ownership ID was silently overwritten.'
+Assert-Throws { Assert-DesiredPolicy $appxTampered $exe } 'Modified effective baseline was accepted.'
+$appxReplaced = Read-PolicyXml $standalone.OuterXml
+$appxReplaced.SelectSingleNode('//RuleCollection[@Type="Appx"]/FilePublisherRule').SetAttribute('Id', '44444444-4444-4444-8444-444444444444')
+Assert-Throws { Assert-DesiredPolicy $appxReplaced $exe $standalone } 'Read-back verification missed a replaced baseline.'
+$appxWrongMode = Read-PolicyXml $standalone.OuterXml
+$appxWrongMode.SelectSingleNode('//RuleCollection[@Type="Appx"]').SetAttribute('EnforcementMode', 'AuditOnly')
+Assert-Throws { Assert-DesiredPolicy $appxWrongMode $exe $standalone } 'Read-back verification missed changed Appx enforcement.'
+$auditStandalone = Merge-ClientPolicy $empty (New-DesiredPolicy $manifest $false 'AuditOnly')
+Assert ($auditStandalone.SelectSingleNode('//RuleCollection[@Type="Appx"]').GetAttribute('EnforcementMode') -eq 'AuditOnly') 'Audit install enabled packaged-app enforcement.'
 
 $foreignId = '11111111-1111-4111-8111-111111111111'
 $restricted = Read-PolicyXml @"
@@ -48,17 +75,32 @@ $restricted = Read-PolicyXml @"
       <Conditions><FilePathCondition Path="C:\scripts\*" /></Conditions>
     </FilePathRule>
   </RuleCollection>
+  <RuleCollection Type="Appx" EnforcementMode="AuditOnly">
+    <FilePublisherRule Id="33333333-3333-4333-8333-333333333333" Name="Existing packaged-app policy" UserOrGroupSid="S-1-1-0" Action="Allow">
+      <Conditions><FilePublisherCondition PublisherName="Existing publisher" ProductName="Existing app" BinaryName="*"><BinaryVersionRange LowSection="0.0.0.0" HighSection="*" /></FilePublisherCondition></Conditions>
+    </FilePublisherRule>
+  </RuleCollection>
 </AppLockerPolicy>
 "@
 $merged = Merge-ClientPolicy $restricted $combined
 Assert ($merged.SelectNodes('//FilePathCondition[@Path="*"]').Count -eq 1) 'Existing EXE policy was broadened by allow-all.'
 Assert ($merged.SelectSingleNode("//*[@Id='$foreignId']").OuterXml -eq $restricted.SelectSingleNode("//*[@Id='$foreignId']").OuterXml) 'Existing rule changed.'
 Assert ($merged.SelectSingleNode('//RuleCollection[@Type="Script"]').OuterXml -eq $restricted.SelectSingleNode('//RuleCollection[@Type="Script"]').OuterXml) 'Unrelated script policy changed.'
+Assert ($merged.SelectSingleNode('//RuleCollection[@Type="Appx"]').OuterXml -eq $restricted.SelectSingleNode('//RuleCollection[@Type="Appx"]').OuterXml) 'Existing packaged-app restrictions or mode were changed.'
 $disabled = Merge-ClientPolicy $merged $exe
 Assert (-not $disabled.SelectSingleNode('//RuleCollection[@Type="Dll"]')) 'Disabling DLLs left an owned DLL collection.'
 $uninstalled = Merge-ClientPolicy $merged $empty
 Assert ($uninstalled.OuterXml -eq $restricted.OuterXml) 'Uninstall did not restore unrelated policy.'
 Assert ((Merge-ClientPolicy $standalone $empty).DocumentElement.ChildNodes.Count -eq 0) 'Standalone uninstall left rules.'
+
+$foreignExeOnly = Read-PolicyXml $restricted.OuterXml
+[void]$foreignExeOnly.DocumentElement.RemoveChild($foreignExeOnly.SelectSingleNode('//RuleCollection[@Type="Appx"]'))
+$foreignWithClient = Merge-ClientPolicy $foreignExeOnly $exe
+$foreignUninstalled = Merge-ClientPolicy $foreignWithClient $empty
+Assert-PackagedAppSafety $foreignUninstalled
+Assert ($foreignUninstalled.SelectNodes('//FileHashRule').Count -eq 0) 'Uninstall retained Hashgen deny rules.'
+Assert ($foreignUninstalled.SelectSingleNode("//*[@Id='$foreignId']").OuterXml -eq $foreignExeOnly.SelectSingleNode("//*[@Id='$foreignId']").OuterXml) 'Uninstall changed unrelated EXE rule.'
+Assert ($foreignUninstalled.SelectNodes('//RuleCollection[@Type="Appx"]/FilePublisherRule').Count -eq 1) 'Uninstall reintroduced packaged-app lockout for remaining EXE rules.'
 
 $audit = Read-PolicyXml ($restricted.OuterXml.Replace('Type="Exe" EnforcementMode="Enabled"', 'Type="Exe" EnforcementMode="AuditOnly"'))
 Assert-Throws { Merge-ClientPolicy $audit $exe } 'Changing existing rule enforcement must be refused.'
@@ -146,9 +188,21 @@ try {
     Assert-DesiredPolicy (Read-PolicyXml $script:ModelPolicy) $exe
     Invoke-ClientUpdate $config
     Assert ($script:SetCalls -eq 1) 'Unchanged update re-applied policy.'
+    # An older client may have recorded a successful EXE-only application. Its
+    # unchanged hash feed must still repair the missing packaged-app baseline.
+    $legacyCached = Read-PolicyXml $script:ModelPolicy
+    [void]$legacyCached.DocumentElement.RemoveChild($legacyCached.SelectSingleNode('//RuleCollection[@Type="Appx"]'))
+    $script:ModelPolicy = $legacyCached.OuterXml
+    $lastPath = Join-Path $transactionDirectory 'last-update.json'
+    $cached = Get-Content $lastPath -Raw | ConvertFrom-Json
+    $cached.local_policy_sha256 = Get-TextHash $script:ModelPolicy
+    Save-Text $lastPath ($cached | ConvertTo-Json)
+    Invoke-ClientUpdate $config
+    Assert ($script:SetCalls -eq 2) 'Unchanged feed skipped repair of the legacy EXE-only policy.'
+    Assert-DesiredPolicy (Read-PolicyXml $script:ModelPolicy) $exe
     $script:ReceivedManifest = @{schema_version=1; generated_at='invalid'; files=@()}
     Assert-Throws { Invoke-ClientUpdate $config } 'Empty feed accepted by transaction.'
-    Assert ($script:SetCalls -eq 1) 'Failed validation changed policy.'
+    Assert ($script:SetCalls -eq 2) 'Failed validation changed policy.'
 
     # A failed read-back must restore the exact original policy.
     $script:ReceivedManifest = $manifest
