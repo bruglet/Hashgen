@@ -94,6 +94,9 @@ Windows Security and Store-installed apps. Existing packaged-app rules and
 their enforcement mode are preserved without adding a broad allow rule. The
 client checks for packaged-app rules before applying a policy and during effective
 policy verification. An unchanged feed still repairs an older EXE-only policy.
+Policy comparison canonicalizes XML and rule ordering so native Windows
+normalization does not trigger unnecessary reapplication. Effective-policy
+read-back is retried up to three times before rolling back a failed application.
 The candidate must allow the SYSTEM updater script and PowerShell host.
 
 Removing DLL enforcement or uninstalling removes only recognized Hashgen rules;

@@ -35,6 +35,17 @@ Assert-DesiredPolicy $standalone $exe
 Assert-LocalPolicy $standalone $standalone
 $repeated = Merge-ClientPolicy $standalone $exe
 Assert ($repeated.OuterXml -eq $standalone.OuterXml) 'Repeated composition creates duplicates or changes policy.'
+$nativeOrdered = Read-PolicyXml $standalone.OuterXml
+foreach ($collection in $nativeOrdered.SelectNodes('//RuleCollection')) {
+    foreach ($rule in @($collection.SelectNodes('*[@Id]'))) { [void]$collection.RemoveChild($rule); $collection.PrependChild($rule) | Out-Null }
+    $mode = $collection.GetAttribute('EnforcementMode')
+    $collection.RemoveAttribute('EnforcementMode')
+    $collection.SetAttribute('EnforcementMode', $mode)
+}
+Assert ((Get-PolicyDigest $nativeOrdered) -eq (Get-PolicyDigest $standalone)) 'Native rule ordering changed semantic policy digest.'
+$changedDigestPolicy = Read-PolicyXml $standalone.OuterXml
+$changedDigestPolicy.SelectSingleNode('//FileHash').SetAttribute('Data', ('0x' + ('c' * 64)))
+Assert ((Get-PolicyDigest $changedDigestPolicy) -ne (Get-PolicyDigest $standalone)) 'Canonical comparison ignored changed deny hash.'
 
 # Reproduce the 8027 incident: EXE enforcement plus absent/empty Appx rules.
 $legacy = Read-PolicyXml $standalone.OuterXml
@@ -160,13 +171,20 @@ function Enable-IdentityService { }
 function Get-Service { param($Name) return [pscustomobject]@{Status='Running'} }
 function Get-AppLockerPolicy {
     param([switch]$Local, [switch]$Effective, [switch]$Xml)
+    if ($Effective -and $script:TransientReads -gt 0 -and $script:SetCalls -eq 1) { $script:TransientReads--; return '<AppLockerPolicy Version="1" />' }
     if ($Effective -and $script:FailVerification -and $script:SetCalls -eq 1) { return '<AppLockerPolicy Version="1" />' }
     return $script:ModelPolicy
 }
 function Set-AppLockerPolicy {
     param([string]$XmlPolicy)
     $script:SetCalls++
-    $script:ModelPolicy = [System.IO.File]::ReadAllText($XmlPolicy)
+    $native = Read-PolicyXml ([System.IO.File]::ReadAllText($XmlPolicy))
+    foreach ($collection in $native.SelectNodes('//RuleCollection')) {
+        $rules = @($collection.SelectNodes('*[@Id]') | Sort-Object { $_.GetAttribute('Id') })
+        foreach ($rule in $rules) { [void]$collection.RemoveChild($rule) }
+        foreach ($rule in $rules) { [void]$collection.AppendChild($rule) }
+    }
+    $script:ModelPolicy = $native.OuterXml
 }
 function Test-AppLockerPolicy {
     param([string]$XmlPolicy, $Path, [string]$User)
@@ -180,6 +198,7 @@ function Receive-Manifest {
 $transactionDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $transactionDirectory)
 $script:InstallRoot = $transactionDirectory
+$script:TransientReads = 0
 try {
     $manifest.generated_at = '2026-01-01T00:00:00+00:00'
     $config = [pscustomobject]@{enable_dll=$false; enforcement_mode='Enabled'}
@@ -203,6 +222,13 @@ try {
     $script:ReceivedManifest = @{schema_version=1; generated_at='invalid'; files=@()}
     Assert-Throws { Invoke-ClientUpdate $config } 'Empty feed accepted by transaction.'
     Assert ($script:SetCalls -eq 2) 'Failed validation changed policy.'
+
+    $script:ReceivedManifest = $manifest
+    $script:ModelPolicy = $empty.OuterXml
+    $script:SetCalls = 0
+    $script:TransientReads = 1
+    Invoke-ClientUpdate $config
+    Assert ($script:SetCalls -eq 1 -and $script:TransientReads -eq 0) 'Transient effective-policy delay caused rollback rather than bounded retry.'
 
     # A failed read-back must restore the exact original policy.
     $script:ReceivedManifest = $manifest

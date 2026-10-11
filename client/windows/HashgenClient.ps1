@@ -79,6 +79,27 @@ function Get-RuleIndex([xml]$Policy) {
     return ,$index
 }
 
+function Get-PolicyDigest([xml]$Policy) {
+    # Native AppLocker normalizes attribute order and sorts rules by GUID.
+    # Compare canonical policies rather than raw XML serialization.
+    $normalized = Read-PolicyXml $Policy.OuterXml
+    foreach ($collection in $normalized.SelectNodes('/AppLockerPolicy/RuleCollection')) {
+        $rules = @($collection.SelectNodes('*[@Id]') | Sort-Object { ([guid]$_.GetAttribute('Id')).ToString() })
+        foreach ($rule in $rules) { [void]$collection.RemoveChild($rule) }
+        foreach ($rule in $rules) { [void]$collection.AppendChild($rule) }
+    }
+    $collections = @($normalized.SelectNodes('/AppLockerPolicy/RuleCollection') | Sort-Object { $_.GetAttribute('Type') })
+    foreach ($collection in $collections) { [void]$normalized.DocumentElement.RemoveChild($collection) }
+    foreach ($collection in $collections) { [void]$normalized.DocumentElement.AppendChild($collection) }
+    Add-Type -AssemblyName System.Security
+    $transform = New-Object System.Security.Cryptography.Xml.XmlDsigC14NTransform
+    $transform.LoadInput($normalized)
+    $stream = $transform.GetOutput([System.IO.Stream])
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose(); $stream.Dispose() }
+}
+
 function Test-OwnedRule([System.Xml.XmlElement]$Rule, [string]$Collection) {
     if ($Rule.GetAttribute('UserOrGroupSid') -ne 'S-1-1-0' -or $Rule.SelectSingleNode('Exceptions')) { return $false }
     $id = $Rule.GetAttribute('Id')
@@ -335,6 +356,19 @@ function Save-Text([string]$Path, [string]$Text) {
     } finally { if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) } }
 }
 
+function Wait-DesiredPolicy([xml]$Desired, [xml]$Candidate) {
+    # Effective policy can briefly lag a successful local policy replacement.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Assert-DesiredPolicy (Read-PolicyXml (Get-AppLockerPolicy -Effective -Xml)) $Desired $Candidate
+            return
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
 function Write-ClientLog([string]$Message) {
     $path = Join-Path $script:InstallRoot 'client.log'
     if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 1MB) {
@@ -466,7 +500,7 @@ function Invoke-ClientUpdate($Config) {
         if (Test-Path -LiteralPath $lastPath) {
             $last = Get-Content $lastPath -Raw -Encoding UTF8 | ConvertFrom-Json
             if ($last.desired_sha256 -eq $desiredDigest -and $last.local_policy_sha256 -eq (Get-TextHash $originalText) -and
-                $candidate.OuterXml -eq $local.OuterXml) {
+                (Get-PolicyDigest $candidate) -eq (Get-PolicyDigest $local)) {
                 Assert-DesiredPolicy $effective $desired $candidate
                 Enable-IdentityService
                 Write-ClientLog 'Policy unchanged; no application needed.'
@@ -494,7 +528,7 @@ function Invoke-ClientUpdate($Config) {
         try {
             Set-AppLockerPolicy -XmlPolicy $candidatePath
             $readBack = Get-AppLockerPolicy -Local -Xml
-            Assert-DesiredPolicy (Read-PolicyXml (Get-AppLockerPolicy -Effective -Xml)) $desired $candidate
+            Wait-DesiredPolicy $desired $candidate
             $state = @{ schema_version = 1; updated_at = [DateTime]::UtcNow.ToString('o');
                 server_generated_at = $manifest.generated_at; desired_sha256 = $desiredDigest;
                 local_policy_sha256 = (Get-TextHash $readBack); enable_dll = [bool]$Config.enable_dll;
